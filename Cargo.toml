@@ -1,0 +1,16 @@
+[package]
+name = "cloudflare_2020_systems"
+version = "0.1.0"
+authors = ["markrepedersen <markrepedersen@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+clap = "3.0.0-beta.2"
+strum = "0.19"
+strum_macros = "0.19"
+url = "2.1.1"
+nom = "5"
+
+[features]
+default = []
+chunks = []
