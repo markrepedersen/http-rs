@@ -24,7 +24,9 @@ where
 #[derive(Debug)]
 pub enum ErrorKind {
     Nom(NomErrorKind),
-    UTF8(String),
+    Context(&'static str),
+    Custom(String),
+    Malformed,
 }
 
 pub struct Error<I> {
@@ -32,12 +34,15 @@ pub struct Error<I> {
 }
 
 impl<I> Error<I> {
-    pub fn utf8(input: I) -> Self {
+    pub fn malformed(input: I) -> Self {
         Self {
-            errors: vec![(
-                input,
-                ErrorKind::UTF8("Invalid input: UTF-8 decoding failed.".to_string()),
-            )],
+            errors: vec![(input, ErrorKind::Malformed)],
+        }
+    }
+
+    pub fn custom(input: I, msg: String) -> Self {
+        Self {
+            errors: vec![(input, ErrorKind::Custom(msg))],
         }
     }
 }
@@ -90,8 +95,10 @@ impl<'a> fmt::Debug for Error<&'a [u8]> {
 
         for (input, kind) in self.errors.iter().rev() {
             let prefix = match kind {
+                ErrorKind::Context(ctx) => format!("...in {}", ctx),
                 ErrorKind::Nom(err) => format!("nom error {:?}", err),
-                ErrorKind::UTF8(err) => format!("err: {}", err),
+                ErrorKind::Custom(err) => format!("err: {}", err),
+                ErrorKind::Malformed => format!("Malformed packet"),
             };
 
             write!(f, "{}\n", prefix)?;
@@ -119,6 +126,11 @@ impl<I> NomParseError<I> for Error<I> {
 
     fn append(input: I, kind: NomErrorKind, mut other: Self) -> Self {
         other.errors.push((input, ErrorKind::Nom(kind)));
+        other
+    }
+
+    fn add_context(input: I, ctx: &'static str, mut other: Self) -> Self {
+        other.errors.push((input, ErrorKind::Context(ctx)));
         other
     }
 }

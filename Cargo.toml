@@ -1,5 +1,5 @@
 [package]
-name = "cloudflare_2020_systems"
+name = "http-rs"
 version = "0.1.0"
 authors = ["markrepedersen <markrepedersen@gmail.com>"]
 edition = "2018"
