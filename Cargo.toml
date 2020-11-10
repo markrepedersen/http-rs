@@ -9,6 +9,7 @@ strum = "0.19"
 strum_macros = "0.19"
 nom = "5"
 cookie-factory = "0.3"
+better-panic = "0.2.0"
 
 [features]
 default = []

@@ -17,6 +17,7 @@ use nom::{
     sequence::{preceded, terminated},
 };
 use parse::{Input, ParseResult};
+use std::fmt::Debug;
 use std::{
     collections::HashMap,
     io::{Read, Write},
@@ -27,6 +28,7 @@ use std::{
 use strum_macros::{Display, EnumString};
 
 // -------------- UTILS --------------------
+
 /**
  * Unicode Hexadecimal values for some common control characters.
  */
@@ -69,7 +71,7 @@ pub struct Request<'a> {
     pub method: Method,
     pub path: &'a str,
     pub version: &'a str,
-    pub headers: Headers<'a>,
+    pub headers: Headers,
     pub body: Option<Body>,
 }
 
@@ -90,7 +92,7 @@ impl<'a> Request<'a> {
     /**
      * Send the request.
      */
-    pub fn send(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn send(&self) -> Result<Response, Box<dyn std::error::Error>> {
         match self.headers.get(&CommonHeaders::HOST.to_string()) {
             Some(host) => {
                 let mut stream = TcpStream::connect(host)?;
@@ -103,19 +105,7 @@ impl<'a> Request<'a> {
 
                 stream.read_to_end(&mut buf)?;
 
-                match Response::parse(&mut buf) {
-                    Ok(res) => {
-                        assert_eq!(res.status.protocol_version, "HTTP/1.1");
-                        assert_eq!(res.status.status_code, StatusCode::MovedPermanently);
-                        assert_eq!(res.status.description, "Moved Permanently");
-                        assert_eq!(res.headers.get("Connection"), Some(&"close"));
-                        assert_eq!(res.headers.get("Content-Type"), Some(&"text/html"));
-                        dbg!(res);
-                    }
-                    Err(e) => panic!("Error: {}", e),
-                };
-
-                Ok(())
+                Ok(Response::parse(&mut buf).unwrap())
             }
             None => panic!("No URL provided."),
         }
@@ -193,7 +183,7 @@ impl<'a> Request<'a> {
     /**
      * Parse a request from a stream of bytes.
      */
-    pub fn parse(i: Input<'a>) -> Result<Self, nom::Err<parse::Error<Input<'a>>>> {
+    pub fn parse(i: Input<'a>) -> Result<Self, Box<dyn std::error::Error + 'a>> {
         let (_, req) = context("Request", |i| {
             let (i, method) = Method::parse(i)?;
             let (i, path) = preceded(space1, take_till(|c| c == CtrlChars::Space as u8))(i)?;
@@ -256,19 +246,19 @@ impl Method {
 }
 
 #[derive(Debug)]
-pub struct Header<'a> {
-    pub key: &'a str,
-    pub value: &'a str,
+pub struct Header {
+    pub key: String,
+    pub value: String,
 }
 
-impl<'a> Header<'a> {
-    pub fn parse(i: Input<'a>) -> ParseResult<Self> {
+impl Header {
+    pub fn parse(i: Input) -> ParseResult<Self> {
         context("Header", |i| {
             let (i, key) = terminated(take_till(|c| c == CtrlChars::Colon as u8), tag(b": "))(i)?;
             let (i, value) = terminated(take_till(|c| c == CtrlChars::CR as u8), crlf)(i)?;
             let res = Self {
-                key: from_utf8(key).unwrap(),
-                value: from_utf8(value).unwrap(),
+                key: from_utf8(key).unwrap().to_string(),
+                value: from_utf8(value).unwrap().to_string(),
             };
 
             Ok((i, res))
@@ -277,12 +267,12 @@ impl<'a> Header<'a> {
 }
 
 #[derive(Debug)]
-pub struct Headers<'a> {
-    headers: HashMap<&'a str, &'a str>,
+pub struct Headers {
+    headers: HashMap<String, String>,
 }
 
-impl<'a> Headers<'a> {
-    pub fn serialize<W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
+impl Headers {
+    pub fn serialize<'a, W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
         all(self
             .headers
             .iter()
@@ -295,7 +285,7 @@ impl<'a> Headers<'a> {
         }
     }
 
-    pub fn parse(i: Input<'a>) -> ParseResult<Self> {
+    pub fn parse(i: Input) -> ParseResult<Self> {
         context("Headers", |i| {
             let (i, (data, _)) = many_till(Header::parse, crlf)(i)?;
             let mut headers = HashMap::new();
@@ -308,12 +298,12 @@ impl<'a> Headers<'a> {
         })(i)
     }
 
-    pub fn insert(&mut self, key: &'a str, val: &'a str) {
-        self.headers.insert(key, val);
+    pub fn insert(&mut self, key: &str, val: &str) {
+        self.headers.insert(key.to_string(), val.to_string());
     }
 
-    pub fn get(&self, key: &str) -> Option<&&'a str> {
-        self.headers.get(key)
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.headers.get(&key.to_string())
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
@@ -402,23 +392,23 @@ impl StatusCode {
 }
 
 #[derive(Debug)]
-pub struct ResponseStatus<'a> {
-    pub protocol_version: &'a str,
+pub struct ResponseStatus {
+    pub protocol_version: String,
     pub status_code: StatusCode,
-    pub description: &'a str,
+    pub description: String,
 }
 
-impl<'a> ResponseStatus<'a> {
-    pub fn parse(i: Input<'a>) -> ParseResult<Self> {
+impl ResponseStatus {
+    pub fn parse(i: Input) -> ParseResult<Self> {
         context("Status", |i| {
             let (i, protocol_version) =
                 terminated(take_till(|c| c == CtrlChars::Space as u8), space1)(i)?;
             let (i, status_code) = StatusCode::parse(i)?;
             let (i, description) = terminated(take_till(|c| c == CtrlChars::CR as u8), crlf)(i)?;
             let res = Self {
-                protocol_version: from_utf8(protocol_version).unwrap(),
+                protocol_version: from_utf8(protocol_version).unwrap().to_string(),
                 status_code,
-                description: from_utf8(description).unwrap(),
+                description: from_utf8(description).unwrap().to_string(),
             };
 
             Ok((i, res))
@@ -427,36 +417,36 @@ impl<'a> ResponseStatus<'a> {
 }
 
 #[derive(Debug)]
-pub struct SingleResourceResponseBody<'a> {
-    pub file: &'a str,
+pub struct SingleResourceResponseBody {
+    pub file: String,
 }
 
 #[derive(Debug)]
-pub struct ChunkedResponseBody<'a> {
-    pub file: &'a str,
+pub struct ChunkedResponseBody {
+    pub file: String,
 }
 
 #[derive(Debug)]
-pub struct MultiResourceResponseBody<'a> {
-    pub files: Vec<SingleResourceResponseBody<'a>>,
+pub struct MultiResourceResponseBody {
+    pub files: Vec<SingleResourceResponseBody>,
 }
 
 #[derive(Debug)]
-pub enum ResponseBody<'a> {
-    Single(SingleResourceResponseBody<'a>),
-    ChunkedSingle(ChunkedResponseBody<'a>),
-    Multi(MultiResourceResponseBody<'a>),
+pub enum ResponseBody {
+    Single(SingleResourceResponseBody),
+    ChunkedSingle(ChunkedResponseBody),
+    Multi(MultiResourceResponseBody),
 }
 
 #[derive(Debug)]
-pub struct Response<'a> {
-    pub status: ResponseStatus<'a>,
-    pub headers: Headers<'a>,
+pub struct Response {
+    pub status: ResponseStatus,
+    pub headers: Headers,
     pub body: Body,
 }
 
-impl<'a> Response<'a> {
-    pub fn parse(i: Input<'a>) -> Result<Self, nom::Err<parse::Error<Input<'a>>>> {
+impl Response {
+    pub fn parse<'a>(i: Input<'a>) -> Result<Self, Box<dyn std::error::Error + 'a>> {
         let (_, response) = context("Response", |i| {
             let (i, status) = ResponseStatus::parse(i)?;
             let (i, headers) = Headers::parse(i)?;
@@ -476,6 +466,8 @@ impl<'a> Response<'a> {
 
 #[test]
 fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
+    better_panic::install();
+
     let mut req_str = String::new();
 
     req_str.push_str("GET / HTTP/1.0");
@@ -493,14 +485,6 @@ fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(req.method, Method::GET);
             assert_eq!(req.path, "/");
             assert_eq!(req.version, "HTTP/1.0");
-            assert_eq!(
-                req.headers.get(&CommonHeaders::HOST.to_string()),
-                Some(&"www.rust-lang.org")
-            );
-            assert_eq!(
-                req.headers.get(&CommonHeaders::CONNECTION.to_string()),
-                Some(&"close")
-            )
         }
         Err(e) => panic!("Error: {}", e),
     }
@@ -509,13 +493,22 @@ fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_parse_response() -> Result<(), Box<dyn std::error::Error>> {
-    Request::default()
+fn test_parse_response() {
+    better_panic::install();
+    let res = Request::default()
         .method(Method::GET)
         .path("/")
         .url("www.rust-lang.org:80")
         .header(&CommonHeaders::CONNECTION.to_string(), "close")
-        .send()?;
+        .send()
+        .unwrap();
 
-    Ok(())
+    assert_eq!(res.status.protocol_version, "HTTP/1.1");
+    assert_eq!(res.status.status_code, StatusCode::MovedPermanently);
+    assert_eq!(res.status.description, "Moved Permanently");
+    assert_eq!(res.headers.get("Connection"), Some(&String::from("close")));
+    assert_eq!(
+        res.headers.get("Content-Type"),
+        Some(&String::from("text/html"))
+    );
 }

@@ -2,7 +2,10 @@ use nom::{
     error::{ErrorKind as NomErrorKind, ParseError as NomParseError},
     ErrorConvert, Slice,
 };
-use std::{fmt, ops::RangeFrom};
+use std::{
+    fmt::{self, Debug},
+    ops::RangeFrom,
+};
 
 pub type Input<'a> = &'a [u8];
 pub type ParseResult<'a, T> = nom::IResult<Input<'a>, T, Error<Input<'a>>>;
@@ -49,7 +52,7 @@ impl<I> Error<I> {
 
 impl<'a> fmt::Debug for Error<&'a [u8]> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "/!\\ ersatz parsing error\n")?;
+        write!(f, "/!\\ Parsing error\n")?;
 
         let mut shown_input = None;
         let margin_left = 4;
