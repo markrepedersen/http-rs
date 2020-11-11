@@ -10,6 +10,10 @@ strum_macros = "0.19"
 nom = "5"
 cookie-factory = "0.3"
 better-panic = "0.2.0"
+rustls = "0.18"
+webpki = "0.21"
+webpki-roots = "0.20"
+flate2 = "1"
 
 [features]
 default = []

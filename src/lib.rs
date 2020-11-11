@@ -1,34 +1,41 @@
 mod parse;
-use cookie_factory::multi::all;
-use cookie_factory::sequence::tuple;
-use cookie_factory::{combinator::string, gen, SerializeFn};
-use nom::character::streaming::space1;
-use nom::{
-    bytes::{
-        streaming::take_till,
-        streaming::{tag, take_while},
+
+use {
+    cookie_factory::{combinator::string, gen, multi::all, sequence::tuple, SerializeFn},
+    flate2::bufread::{DeflateDecoder, GzDecoder, ZlibDecoder},
+    nom::{
+        bytes::{
+            streaming::take_till,
+            streaming::{tag, take_while},
+        },
+        character::{
+            is_alphabetic,
+            streaming::{crlf, digit1, space1},
+        },
+        error::context,
+        multi::many_till,
+        sequence::{preceded, terminated},
     },
-    character::{
-        is_alphabetic,
-        streaming::{crlf, digit1},
+    parse::{Input, ParseResult},
+    rustls::{ClientConfig, ClientSession, Stream},
+    std::{
+        collections::HashMap,
+        error::Error,
+        fmt::{Debug, Display},
+        io::{self, ErrorKind::ConnectionAborted},
+        io::{Read, Write},
+        net::TcpStream,
+        str::{from_utf8, from_utf8_unchecked, FromStr},
+        string::ToString,
+        sync::Arc,
     },
-    error::context,
-    multi::many_till,
-    sequence::{preceded, terminated},
+    strum_macros::{Display, EnumString},
+    webpki::DNSNameRef,
+    webpki_roots::TLS_SERVER_ROOTS,
+    CommonHeaders::*,
+    CtrlChars::Colon,
+    CtrlChars::CR,
 };
-use parse::{Input, ParseResult};
-use std::{
-    collections::HashMap,
-    fmt::{Debug, Display},
-    io::{Read, Write},
-    net::TcpStream,
-    str::{from_utf8, from_utf8_unchecked, FromStr},
-    string::ToString,
-};
-use strum_macros::{Display, EnumString};
-use CommonHeaders::*;
-use CtrlChars::Colon;
-use CtrlChars::CR;
 
 // -------------- UTILS --------------------
 
@@ -55,31 +62,46 @@ pub enum CommonHeaders {
     Connection,
     #[strum(serialize = "ACCEPT")]
     Accept,
+    #[strum(serialize = "ACCEPT-ENCODING")]
+    AcceptEncoding,
     #[strum(serialize = "CONTENT-TYPE")]
     ContentType,
     #[strum(serialize = "CONTENT-LENGTH")]
     ContentLength,
+    #[strum(serialize = "CONTENT-ENCODING")]
+    ContentEncoding,
 }
 
 /**
  * Serialize to binary the CRLF control character.
  */
-pub fn serialize_crlf<'a, W: std::io::Write + 'a>() -> impl SerializeFn<W> + 'a {
+pub fn serialize_crlf<'a, W: io::Write + 'a>() -> impl SerializeFn<W> + 'a {
     string("\r\n")
 }
 
 /**
  * Serialize to binary the space character.
  */
-pub fn serialize_space<'a, W: std::io::Write + 'a>() -> impl SerializeFn<W> + 'a {
+pub fn serialize_space<'a, W: io::Write + 'a>() -> impl SerializeFn<W> + 'a {
     string(" ")
+}
+
+#[derive(Display, Debug, PartialEq)]
+pub enum Protocol {
+    // The default protocol for requests.
+    HTTP,
+    // HTTP over TLS.
+    HTTPS,
 }
 
 //-------------- REQUEST ------------------
 #[derive(Debug)]
 pub struct Request<'a> {
     pub method: Method,
+    pub protocol: Protocol,
+    pub host: Option<&'a str>,
     pub path: &'a str,
+    pub port: Option<u16>,
     pub version: &'a str,
     pub headers: Headers,
     pub body: Option<Body>,
@@ -87,20 +109,59 @@ pub struct Request<'a> {
 
 impl<'a> Request<'a> {
     /**
+    Send the request over HTTPS.
+    */
+    fn send_https(
+        mut socket: &TcpStream,
+        mut buf: &mut Vec<u8>,
+        host: &str,
+    ) -> Result<(), io::Error> {
+        let mut config = ClientConfig::new();
+        config
+            .root_store
+            .add_server_trust_anchors(&TLS_SERVER_ROOTS);
+
+        let config = Arc::new(config);
+        let dns = DNSNameRef::try_from_ascii_str(host).unwrap();
+        let mut client = ClientSession::new(&config, dns);
+        let mut tls_stream = Stream::new(&mut client, &mut socket);
+
+        tls_stream.write_all(&mut buf)?;
+        buf.clear();
+
+        if let Err(e) = tls_stream.read_to_end(&mut buf) {
+            if e.kind() != ConnectionAborted {
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_http(mut socket: &TcpStream, buf: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+        socket.write_all(buf)?;
+        buf.clear();
+        socket.read_to_end(buf)?;
+
+        Ok(())
+    }
+
+    /**
      * Send the request.
      */
-    pub fn send(&self) -> Result<Response, Box<dyn std::error::Error>> {
-        match self.headers.get(&Host.to_string()) {
+    pub fn send(&self) -> Result<Response, Box<dyn Error>> {
+        match self.host {
             Some(host) => {
-                let mut stream = TcpStream::connect(host)?;
+                let port = if let Some(port) = self.port { port } else { 80 };
+                let socket = TcpStream::connect(format!("{}:{}", host, port))?;
                 let buf = Vec::new();
                 let (mut buf, _) = gen(self.serialize(), buf)?;
 
-                stream.write_all(&mut buf)?;
-
-                buf.clear();
-
-                stream.read_to_end(&mut buf)?;
+                if self.protocol == Protocol::HTTPS {
+                    Self::send_https(&socket, &mut buf, host)?;
+                } else {
+                    Self::send_http(&socket, &mut buf)?;
+                }
 
                 Ok(Response::parse(&mut buf).unwrap())
             }
@@ -115,6 +176,9 @@ impl<'a> Request<'a> {
         Self {
             method: Method::GET,
             path: "/",
+            protocol: Protocol::HTTP,
+            host: None,
+            port: Some(80),
             version: "HTTP/1.1",
             headers: Headers::new(),
             body: None,
@@ -138,10 +202,28 @@ impl<'a> Request<'a> {
     }
 
     /**
-     * Set the URL of the request.
+     * Set the host of the request.
      */
-    pub fn url(&mut self, url: &'a str) -> &mut Self {
-        self.header("HOST", url);
+    pub fn host(&mut self, host: &'a str) -> &mut Self {
+        self.host = Some(host);
+        self.header("HOST", host);
+        self
+    }
+
+    /**
+    Enables HTTP over TLS.
+     */
+    pub fn https(&mut self) -> &mut Self {
+        self.port = Some(443);
+        self.protocol = Protocol::HTTPS;
+        self
+    }
+
+    /**
+     * Set the port of the request.
+     */
+    pub fn port(&mut self, port: u16) -> &mut Self {
+        self.port = Some(port);
         self
     }
 
@@ -180,7 +262,7 @@ impl<'a> Request<'a> {
     /**
      * Parse a request from a stream of bytes.
      */
-    pub fn parse(i: Input<'a>) -> Result<Self, Box<dyn std::error::Error + 'a>> {
+    pub fn parse(i: Input<'a>) -> Result<Self, Box<dyn Error + 'a>> {
         let (_, req) = context("Request", |i| {
             let (i, method) = Method::parse(i)?;
             let (i, path) = preceded(space1, take_till(|c| c == CtrlChars::Space as u8))(i)?;
@@ -196,6 +278,9 @@ impl<'a> Request<'a> {
             let res = Self {
                 method,
                 path: from_utf8(path).unwrap(),
+                protocol: Protocol::HTTP,
+                host: None,
+                port: None,
                 version: from_utf8(version).unwrap(),
                 headers,
                 body,
@@ -207,7 +292,7 @@ impl<'a> Request<'a> {
         Ok(req)
     }
 
-    fn serialize<W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
+    fn serialize<W: io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
         tuple((
             self.method.serialize(),
             serialize_space(),
@@ -234,7 +319,7 @@ pub enum Method {
 }
 
 impl Method {
-    pub fn serialize<'a, W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
+    pub fn serialize<'a, W: io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
         string(self.to_string())
     }
 
@@ -285,7 +370,7 @@ pub struct Headers {
 }
 
 impl Headers {
-    pub fn serialize<'a, W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
+    pub fn serialize<'a, W: io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
         all(self
             .headers
             .iter()
@@ -361,6 +446,34 @@ impl Debug for SinglePartBody {
 }
 
 impl SinglePartBody {
+    pub fn decompress(&mut self, headers: &Headers) -> Result<&Self, Box<dyn Error>> {
+        let old_buf = &self.data[..];
+        let mut new_buf = Vec::new();
+        let header = headers.get(&ContentEncoding.to_string());
+
+        match header.map(|h| &h[..]) {
+            Some("GZIP") => {
+                let mut decoder = GzDecoder::new(old_buf);
+                decoder.read_to_end(&mut new_buf)?;
+                self.data = new_buf;
+            }
+            Some("DEFLATE") => {
+                let mut decoder = DeflateDecoder::new(old_buf);
+                decoder.read_to_end(&mut new_buf)?;
+                self.data = new_buf;
+            }
+            Some("ZLIB") => {
+                let mut decoder = ZlibDecoder::new(old_buf);
+                decoder.read_to_end(&mut new_buf)?;
+                self.data = new_buf;
+            }
+            Some(_) => unimplemented!("Unknown compression schema."),
+            None => println!("Response body was not compressed"),
+        };
+
+        Ok(self)
+    }
+
     pub fn parse(i: Input, len: Option<usize>) -> ParseResult<Self> {
         context("Single-part Body", |i: Input| {
             let data = if let Some(len) = len {
@@ -388,6 +501,7 @@ pub struct MultiPartBody {
 #[derive(Debug, PartialEq, EnumString, Eq)]
 pub enum StatusCode {
     Success = 200,
+    BadRequest = 400,
     NotFound = 404,
     MovedPermanently = 301,
 }
@@ -399,6 +513,7 @@ impl StatusCode {
         unsafe {
             match from_utf8_unchecked(i) {
                 "200" => Some(Success),
+                "400" => Some(BadRequest),
                 "404" => Some(NotFound),
                 "301" => Some(MovedPermanently),
                 _ => None,
@@ -416,7 +531,7 @@ impl StatusCode {
                 None => {
                     unsafe {
                         panic!(
-                            "[UTF-8 decoding] Invalid HTTP status code '{}'",
+                            "[UTF-8 decoding] Invalid HTTP status code '{}'.",
                             from_utf8_unchecked(status_code)
                         );
                     };
@@ -461,7 +576,7 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn parse<'a>(i: Input<'a>) -> Result<Self, Box<dyn std::error::Error + 'a>> {
+    pub fn parse<'a>(i: Input<'a>) -> Result<Self, Box<dyn Error + 'a>> {
         let (_, response) = context("Response", |i| {
             let (i, status) = ResponseStatus::parse(i)?;
             let (i, headers) = Headers::parse(i)?;
@@ -486,7 +601,7 @@ impl Response {
 }
 
 #[test]
-fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
+fn test_parse_request() -> Result<(), Box<dyn Error>> {
     better_panic::install();
 
     let mut req_str = String::new();
@@ -514,28 +629,46 @@ fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_parse_response() {
+fn test_parse_response() -> Result<(), Box<dyn Error>> {
     better_panic::install();
     let connection_header = Connection.to_string();
-    let mut res = Request::default();
-    let res = res
-        .method(Method::GET)
-        .path("/")
-        .url("www.rust-lang.org:80")
+    let accept_encoding = AcceptEncoding.to_string();
+    let mut req = Request::default();
+
+    req.method(Method::GET)
+        .path("/gzip")
+        .host("httpbin.org")
+        .https()
         .header(&connection_header, "close")
-        .send()
-        .unwrap();
+        .header(&accept_encoding, "gzip; deflate");
+
+    println!("{:#?}", req);
+
+    let mut res = req.send().unwrap();
 
     assert_eq!(res.status.protocol_version, "HTTP/1.1");
-    assert_eq!(res.status.status_code, StatusCode::MovedPermanently);
-    assert_eq!(res.status.description, "Moved Permanently");
+    assert_eq!(res.status.status_code, StatusCode::Success);
+    assert_eq!(res.status.description, "OK");
     assert_eq!(
         res.headers.get(&Connection.to_string()),
         Some(&String::from("CLOSE"))
     );
     assert_eq!(
         res.headers.get(&ContentType.to_string()),
-        Some(&String::from("TEXT/HTML"))
+        Some(&String::from("APPLICATION/JSON"))
     );
+
+    match &mut res.body {
+        Some(ref mut body) => match body {
+            Body::Single(ref mut body) => {
+                body.decompress(&res.headers)?;
+            }
+            Body::Multi(_) => unimplemented!(),
+        },
+        None => panic!("No body for response."),
+    };
+
     dbg!(res);
+
+    Ok(())
 }
