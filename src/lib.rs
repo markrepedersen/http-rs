@@ -17,15 +17,18 @@ use nom::{
     sequence::{preceded, terminated},
 };
 use parse::{Input, ParseResult};
-use std::fmt::Debug;
 use std::{
     collections::HashMap,
+    fmt::{Debug, Display},
     io::{Read, Write},
     net::TcpStream,
     str::{from_utf8, from_utf8_unchecked, FromStr},
     string::ToString,
 };
 use strum_macros::{Display, EnumString};
+use CommonHeaders::*;
+use CtrlChars::Colon;
+use CtrlChars::CR;
 
 // -------------- UTILS --------------------
 
@@ -46,9 +49,16 @@ pub enum CtrlChars {
  */
 #[derive(Debug, Display, PartialEq, EnumString, Eq)]
 pub enum CommonHeaders {
-    HOST,
-    CONNECTION,
-    ACCEPT,
+    #[strum(serialize = "HOST")]
+    Host,
+    #[strum(serialize = "CONNECTION")]
+    Connection,
+    #[strum(serialize = "ACCEPT")]
+    Accept,
+    #[strum(serialize = "CONTENT-TYPE")]
+    ContentType,
+    #[strum(serialize = "CONTENT-LENGTH")]
+    ContentLength,
 }
 
 /**
@@ -76,24 +86,11 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    fn serialize<W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
-        tuple((
-            self.method.serialize(),
-            serialize_space(),
-            string(self.path),
-            serialize_space(),
-            string(self.version),
-            serialize_crlf(),
-            self.headers.serialize(),
-            serialize_crlf(),
-        ))
-    }
-
     /**
      * Send the request.
      */
     pub fn send(&self) -> Result<Response, Box<dyn std::error::Error>> {
-        match self.headers.get(&CommonHeaders::HOST.to_string()) {
+        match self.headers.get(&Host.to_string()) {
             Some(host) => {
                 let mut stream = TcpStream::connect(host)?;
                 let buf = Vec::new();
@@ -101,7 +98,7 @@ impl<'a> Request<'a> {
 
                 stream.write_all(&mut buf)?;
 
-                let mut buf: Vec<u8> = vec![];
+                buf.clear();
 
                 stream.read_to_end(&mut buf)?;
 
@@ -175,8 +172,8 @@ impl<'a> Request<'a> {
     /**
      * Set the request's body.
      */
-    pub fn body(&mut self, body: Body) -> &mut Self {
-        self.body = Some(body);
+    pub fn body(&mut self, i: Input<'a>) -> &mut Self {
+        self.body = Body::parse(i, None).ok().map(|(_, body)| body);
         self
     }
 
@@ -187,24 +184,40 @@ impl<'a> Request<'a> {
         let (_, req) = context("Request", |i| {
             let (i, method) = Method::parse(i)?;
             let (i, path) = preceded(space1, take_till(|c| c == CtrlChars::Space as u8))(i)?;
-            let (i, version) = preceded(
-                space1,
-                terminated(take_till(|c| c == CtrlChars::CR as u8), crlf),
-            )(i)?;
+            let (i, version) = preceded(space1, terminated(take_till(|c| c == CR as u8), crlf))(i)?;
             let (i, headers) = Headers::parse(i)?;
-            let (i, body) = Body::parse(i)?;
+            let (i, body) = match headers.get(&ContentLength.to_string()) {
+                Some(len) => {
+                    let (i, body) = Body::parse(i, len.parse().ok())?;
+                    (i, Some(body))
+                }
+                None => (i, None),
+            };
             let res = Self {
                 method,
                 path: from_utf8(path).unwrap(),
                 version: from_utf8(version).unwrap(),
                 headers,
-                body: Some(body),
+                body,
             };
 
             Ok((i, res))
         })(i)?;
 
         Ok(req)
+    }
+
+    fn serialize<W: std::io::Write + 'a>(&'a self) -> impl SerializeFn<W> + 'a {
+        tuple((
+            self.method.serialize(),
+            serialize_space(),
+            string(self.path),
+            serialize_space(),
+            string(self.version),
+            serialize_crlf(),
+            self.headers.serialize(),
+            serialize_crlf(),
+        ))
     }
 }
 
@@ -254,11 +267,11 @@ pub struct Header {
 impl Header {
     pub fn parse(i: Input) -> ParseResult<Self> {
         context("Header", |i| {
-            let (i, key) = terminated(take_till(|c| c == CtrlChars::Colon as u8), tag(b": "))(i)?;
-            let (i, value) = terminated(take_till(|c| c == CtrlChars::CR as u8), crlf)(i)?;
+            let (i, key) = terminated(take_till(|c| c == Colon as u8), tag(b": "))(i)?;
+            let (i, value) = terminated(take_till(|c| c == CR as u8), crlf)(i)?;
             let res = Self {
-                key: from_utf8(key).unwrap().to_string(),
-                value: from_utf8(value).unwrap().to_string(),
+                key: from_utf8(key).unwrap().to_string().to_uppercase(),
+                value: from_utf8(value).unwrap().to_string().to_uppercase(),
             };
 
             Ok((i, res))
@@ -311,32 +324,56 @@ impl Headers {
     }
 }
 
-#[derive(Debug)]
+#[derive(Display, Debug)]
 pub enum Body {
     Single(SinglePartBody),
     Multi(MultiPartBody),
 }
 
 impl Body {
-    pub fn parse(i: Input) -> ParseResult<Self> {
-        context("Body", |i| {
-            let (i, body) = SinglePartBody::parse(i)?;
+    /**
+     * Parse a binary input into request body format.
+     * Takes a *len*, representing the *CONTENT-LENGTH* of the body.
+     * If len is None, then parse until the end of the input. Otherwise, only parse *len* amount of it.
+     */
+    pub fn parse(i: Input, len: Option<usize>) -> ParseResult<Self> {
+        context("Body", |i: Input| {
+            let (i, body) = SinglePartBody::parse(i, len)?;
             Ok((i, Body::Single(body)))
         })(i)
     }
 }
 
-#[derive(Debug)]
 pub struct SinglePartBody {
     data: Vec<u8>,
 }
 
-impl SinglePartBody {
-    pub fn parse(i: Input) -> ParseResult<Self> {
-        context("Single-part Body", |i| {
-            let data = vec![];
+impl Display for SinglePartBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", unsafe { from_utf8_unchecked(&self.data) })
+    }
+}
 
-            Ok((i, Self { data }))
+impl Debug for SinglePartBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#?}", unsafe { from_utf8_unchecked(&self.data) })
+    }
+}
+
+impl SinglePartBody {
+    pub fn parse(i: Input, len: Option<usize>) -> ParseResult<Self> {
+        context("Single-part Body", |i: Input| {
+            let data = if let Some(len) = len {
+                &i[..len]
+            } else {
+                &i[..]
+            };
+            Ok((
+                i,
+                Self {
+                    data: data.to_vec(),
+                },
+            ))
         })(i)
     }
 }
@@ -404,7 +441,7 @@ impl ResponseStatus {
             let (i, protocol_version) =
                 terminated(take_till(|c| c == CtrlChars::Space as u8), space1)(i)?;
             let (i, status_code) = StatusCode::parse(i)?;
-            let (i, description) = terminated(take_till(|c| c == CtrlChars::CR as u8), crlf)(i)?;
+            let (i, description) = terminated(take_till(|c| c == CR as u8), crlf)(i)?;
             let res = Self {
                 protocol_version: from_utf8(protocol_version).unwrap().to_string(),
                 status_code,
@@ -417,32 +454,10 @@ impl ResponseStatus {
 }
 
 #[derive(Debug)]
-pub struct SingleResourceResponseBody {
-    pub file: String,
-}
-
-#[derive(Debug)]
-pub struct ChunkedResponseBody {
-    pub file: String,
-}
-
-#[derive(Debug)]
-pub struct MultiResourceResponseBody {
-    pub files: Vec<SingleResourceResponseBody>,
-}
-
-#[derive(Debug)]
-pub enum ResponseBody {
-    Single(SingleResourceResponseBody),
-    ChunkedSingle(ChunkedResponseBody),
-    Multi(MultiResourceResponseBody),
-}
-
-#[derive(Debug)]
 pub struct Response {
     pub status: ResponseStatus,
     pub headers: Headers,
-    pub body: Body,
+    pub body: Option<Body>,
 }
 
 impl Response {
@@ -450,7 +465,13 @@ impl Response {
         let (_, response) = context("Response", |i| {
             let (i, status) = ResponseStatus::parse(i)?;
             let (i, headers) = Headers::parse(i)?;
-            let (i, body) = Body::parse(i)?;
+            let (i, body) = match headers.get(&ContentLength.to_string()) {
+                Some(len) => {
+                    let (i, body) = Body::parse(i, len.parse().ok())?;
+                    (i, Some(body))
+                }
+                None => (i, None),
+            };
             let res = Self {
                 status,
                 headers,
@@ -495,20 +516,26 @@ fn test_parse_request() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_parse_response() {
     better_panic::install();
-    let res = Request::default()
+    let connection_header = Connection.to_string();
+    let mut res = Request::default();
+    let res = res
         .method(Method::GET)
         .path("/")
         .url("www.rust-lang.org:80")
-        .header(&CommonHeaders::CONNECTION.to_string(), "close")
+        .header(&connection_header, "close")
         .send()
         .unwrap();
 
     assert_eq!(res.status.protocol_version, "HTTP/1.1");
     assert_eq!(res.status.status_code, StatusCode::MovedPermanently);
     assert_eq!(res.status.description, "Moved Permanently");
-    assert_eq!(res.headers.get("Connection"), Some(&String::from("close")));
     assert_eq!(
-        res.headers.get("Content-Type"),
-        Some(&String::from("text/html"))
+        res.headers.get(&Connection.to_string()),
+        Some(&String::from("CLOSE"))
     );
+    assert_eq!(
+        res.headers.get(&ContentType.to_string()),
+        Some(&String::from("TEXT/HTML"))
+    );
+    dbg!(res);
 }
